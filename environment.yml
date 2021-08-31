@@ -1,0 +1,18 @@
+channels:
+  - defaults
+  - pytorch
+  - conda-forge
+dependencies:
+  - black
+  - cudatoolkit=10.2
+  - ipython
+  - jupyter
+  - pillow
+  - pip
+  - tqdm
+  - numpy
+  - ninja
+  - pip:
+      - torch
+      - einops
+      - wandb
