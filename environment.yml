@@ -2,9 +2,12 @@ channels:
   - defaults
   - pytorch
   - conda-forge
+  - nvidia
 dependencies:
   - black
-  - cudatoolkit=10.2
+  - cudatoolkit=11.0.221
+  - imageio
+  - imageio-ffmpeg
   - ipython
   - jupyter
   - pillow
@@ -13,6 +16,8 @@ dependencies:
   - numpy
   - ninja
   - pip:
+      - kmeans-pytorch
       - torch
       - einops
       - wandb
+      - requests

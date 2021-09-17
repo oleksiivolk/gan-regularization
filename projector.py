@@ -25,6 +25,9 @@ import torch.nn.functional as F
 from kmeans_pytorch import kmeans
 import einops
 
+import clip
+
+
 import dnnlib
 import legacy
 
@@ -83,23 +86,16 @@ class Generator:
             sample = torch.from_numpy(z_samples).to(self.device)
         return sample
 
-    def latent_to_image(self, latent, w_noise=None):
+    def latent_to_image(self, latent, latent_noise=None):
+        if latent_noise != None:
+            latent = latent + latent_noise
         if self.latent_space == "w":
-            if False:  # TODO
-                # if w_noise != None:
-                latent += w_noise
             ws = latent.repeat([1, self.G.mapping.num_ws, 1])  # n,1,c -> n, w, c
             images = self.G.synthesis(ws, noise_mode="const")
         elif self.latent_space == "w+":
-            if False:  # TODO
-                # if w_noise != None:
-                latent += w_noise.repeat([1, self.G.mapping.num_ws, 1])
             images = self.G.synthesis(latent, noise_mode="const")
         elif self.latent_space == "z":
             ws = self.G.mapping(latent, None)
-            if False:  # TODO
-                # if w_noise != None:
-                ws += w_noise.repeat([1, self.G.mapping.num_ws, 1])
             images = self.G.synthesis(ws, noise_mode="const")
         return images
 
@@ -116,7 +112,7 @@ class Prior:
     def __post_init__(self):
         if self.prior_type == "l2":
             self.mean_latent = self.calculate_mean_latent()
-        elif self.prior_type == "k_means":
+        elif self.prior_type == "cluster":
             self.clusters = self.sample_clusters()
 
     def forward(self, latent):
@@ -124,16 +120,16 @@ class Prior:
             # Mean W regularization.
             wdist = (latent - self.mean_latent).square().sum()  # N,1,C - 1,1,C
             return wdist * self.regularize_w_l2
-        elif self.prior_type == "k_means":
+        elif self.prior_type == "cluster":
             # Cluster regularization
             w_opt_expanded = einops.repeat(
-                latent, "N 1 C -> N num_clusters C", num_clusters=num_clusters
+                latent, "N W C -> N num_clusters W C", num_clusters=self.num_clusters
             )
             # Compute l2 to each cluster for each w_opt, take min to find closest cluster, sum over N to compute final loss
             w_opt_min_l2, idxs = (
                 (self.clusters - w_opt_expanded).square().sum(dim=2).min(dim=1)
             )
-            return w_opt_min_l2.sum() * regularize_cluster_weight
+            return w_opt_min_l2.sum() * self.regularize_cluster_weight
 
     def calculate_mean_latent(
         self, samples=10000,
@@ -158,6 +154,7 @@ class Task:
     device: str = "cpu"
     task_type: str = "perceptual"
     target: torch.Tensor = None
+    target_str: str = ""
 
     def __post_init__(self):
         if self.task_type == "perceptual":
@@ -175,8 +172,15 @@ class Task:
             self.target_features = self.vgg16(
                 target_images, resize_images=False, return_lpips=True
             )
+        elif self.task_type == "clip_text":
+            self.clip_model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+            text = clip.tokenize([self.target_str]).to(self.device)
+            with torch.no_grad():
+                self.target_features = self.clip_model.encode_text(text)
+            self.cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
 
     def loss(self, images):
+        images = images.to(self.device)
         if self.task_type == "perceptual":
             # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
             images = (images + 1) * (255 / 2)
@@ -186,6 +190,12 @@ class Task:
             # Features for synth images.
             synth_features = self.vgg16(images, resize_images=False, return_lpips=True)
             return (self.target_features - synth_features).square().sum()
+        elif self.task_type == "clip_text":
+            # TODO: Maybe preprocess with clip
+            if images.shape[2] > 224:
+                images = F.interpolate(images, size=(224, 224), mode="area")
+            synth_features = self.clip_model.encode_image(images)
+            return (1 - self.cos(synth_features, self.target_features)).sum()
 
 
 @dataclass(eq=False)
@@ -244,7 +254,7 @@ class Projector:
 
         opt_latent = self.gen.initial_latent(num_images)
 
-        w_out = torch.zeros(
+        latent_out = torch.zeros(
             [num_steps] + list(opt_latent.shape),
             dtype=torch.float32,
             device=self.device,
@@ -263,7 +273,7 @@ class Projector:
 
         for step in range(num_steps):
             t = step / num_steps
-            w_noise_scale = (
+            latent_noise_scale = (
                 w_std
                 * self.initial_noise_factor
                 * max(0.0, 1.0 - t / self.noise_ramp_length) ** 2
@@ -274,8 +284,10 @@ class Projector:
                 param_group["lr"] = lr
 
             # Synth images from opt_w.
-            w_noise = torch.randn_like(opt_latent) * w_noise_scale
-            synth_images = self.gen.latent_to_image(opt_latent, w_noise=w_noise)
+            latent_noise = torch.randn_like(opt_latent) * latent_noise_scale
+            synth_images = self.gen.latent_to_image(
+                opt_latent, latent_noise=latent_noise
+            )
 
             # Noise regularization.
             reg_loss = 0.0
@@ -293,7 +305,7 @@ class Projector:
                     noise = F.avg_pool2d(noise, kernel_size=2)
 
             loss = (
-                self.prior.forward(synth_images)
+                self.prior.forward(opt_latent)
                 + self.task.loss(synth_images)
                 + self.regularize_noise_weight * reg_loss
             )
@@ -305,7 +317,7 @@ class Projector:
             print(f"step {step+1:>4d}/{num_steps}: loss {float(loss):<5.2f}")
 
             # Save projected W for each optimization step.
-            w_out[step] = opt_latent.detach()
+            latent_out[step] = opt_latent.detach()
 
             # Normalize noise.
             with torch.no_grad():
@@ -313,7 +325,7 @@ class Projector:
                     buf -= buf.mean()
                     buf *= buf.square().mean().rsqrt()
 
-        return w_out
+        return latent_out
 
 
 # ----------------------------------------------------------------------------
