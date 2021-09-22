@@ -73,30 +73,32 @@ class Generator:
         return initial_latents.detach().clone().requires_grad_(True)
 
     def sample_latent(self, batch_size):
-        z_samples = np.random.RandomState(self.seed).randn(batch_size, self.G.z_dim)
+        z_samples = torch.randn(batch_size, self.G.z_dim, device=self.device)
         if self.latent_space == "w":
-            sample = self.G.mapping(torch.from_numpy(z_samples).to(self.device), None)[
-                :, :1, :
-            ]  # N, 1, C
+            sample = self.G.mapping(z_samples, None)[:, :1, :]  # N, 1, C
         elif self.latent_space == "w+":
-            sample = self.G.mapping(
-                torch.from_numpy(z_samples).to(self.device), None
-            )  # N, W, C
+            sample = self.G.mapping(z_samples, None)  # N, W, C
         elif self.latent_space == "z":
-            sample = torch.from_numpy(z_samples).to(self.device)
+            sample = z_samples
+        elif self.latent_space == "z+":
+            sample = einops.repeat(z_samples, "N C -> N W C", W=self.G.mapping.num_ws)
         return sample
 
-    def latent_to_image(self, latent, latent_noise=None):
-        if latent_noise != None:
-            latent = latent + latent_noise
+    def latent_to_image(self, latent):
         if self.latent_space == "w":
             ws = latent.repeat([1, self.G.mapping.num_ws, 1])  # n,1,c -> n, w, c
-            images = self.G.synthesis(ws, noise_mode="const")
+            images = self.G.synthesis(ws)
         elif self.latent_space == "w+":
-            images = self.G.synthesis(latent, noise_mode="const")
+            images = self.G.synthesis(latent)
         elif self.latent_space == "z":
             ws = self.G.mapping(latent, None)
-            images = self.G.synthesis(ws, noise_mode="const")
+            images = self.G.synthesis(ws)
+        elif self.latent_space == "z+":
+            N = latent.shape[0]
+            latent = einops.rearrange(latent, "N W C -> (N W) C")
+            ws = self.G.mapping(latent, None)
+            ws = einops.rearrange(ws[:, 0, :], "(N W) C -> N W C", N=N)
+            images = self.G.synthesis(ws)
         return images
 
 
@@ -108,12 +110,14 @@ class Prior:
     regularize_w_l2: float = 0
     regularize_cluster_weight: float = 0
     num_clusters: int = 10
+    cluster_samples: int = 10000
+    optimize_cluster_individually: bool = True
 
     def __post_init__(self):
         if self.prior_type == "l2":
             self.mean_latent = self.calculate_mean_latent()
         elif self.prior_type == "cluster":
-            self.clusters = self.sample_clusters()
+            self.clusters = self.sample_clusters(samples = self.cluster_samples, num_clusters=self.num_clusters)
 
     def forward(self, latent):
         if self.prior_type == "l2":
@@ -122,14 +126,23 @@ class Prior:
             return wdist * self.regularize_w_l2
         elif self.prior_type == "cluster":
             # Cluster regularization
-            w_opt_expanded = einops.repeat(
+            if self.gen.latent_space == 'z':
+                latent = latent.unsqueeze(1)
+
+            latent_size = latent.shape[1]
+            latent_expanded = einops.repeat(
                 latent, "N W C -> N num_clusters W C", num_clusters=self.num_clusters
             )
             # Compute l2 to each cluster for each w_opt, take min to find closest cluster, sum over N to compute final loss
-            w_opt_min_l2, idxs = (
-                (self.clusters - w_opt_expanded).square().sum(dim=2).min(dim=1)
-            )
-            return w_opt_min_l2.sum() * self.regularize_cluster_weight
+            if self.optimize_cluster_individually:
+                latents_cluster_l2s, idxs = (
+                    (self.clusters - latent_expanded).square().sum(dim=3).min(dim=1)
+                )
+            else:
+                latents_cluster_l2s, idxs = (
+                    (self.clusters - latent_expanded).square().sum(dim=(2,3)).min(dim=1)
+                )
+            return latents_cluster_l2s.sum() * self.regularize_cluster_weight / latent_size
 
     def calculate_mean_latent(
         self, samples=10000,
@@ -139,6 +152,8 @@ class Prior:
 
     def sample_clusters(self, distance="euclidean", samples=10000, num_clusters=10):
         latent_samples = self.gen.sample_latent(samples)
+        if self.gen.latent_space == 'w+' or self.gen.latent_space == 'z+':
+            latent_samples = latent_samples[:, :1, :]
 
         cluster_ids_x, cluster_centers = kmeans(
             X=latent_samples,
@@ -207,24 +222,12 @@ class Projector:
     seed: int = 0
     outdir: str = "out"
     initial_learning_rate: float = 0.1
-    initial_noise_factor: float = 0.05
     lr_rampdown_length: float = 0.25
     lr_rampup_length: float = 0.05
-    noise_ramp_length: float = 0.75
-    regularize_noise_weight: float = 1e5
     stats_samples: int = 10000
 
     def __post_init__(self):
         pass
-
-    def compute_stats(self):
-        print(f"Computing W midpoint and stddev using {self.stats_samples} samples...")
-        samples = (
-            self.gen.sample_latent(self.stats_samples).cpu().numpy().astype(np.float32)
-        )
-        avg = np.mean(samples, axis=0, keepdims=True)  # [1, 1, C]
-        std = (np.sum((samples - avg) ** 2) / self.stats_samples) ** 0.5
-        return samples, avg, std
 
     def learning_rate(self, step, num_steps):
         # Learning rate schedule.
@@ -238,20 +241,6 @@ class Projector:
     def project(
         self, num_images=1, num_steps=1000,
     ):
-        # Compute w stats.
-        w_samples, w_avg, w_std = self.compute_stats()
-
-        # Setup noise inputs.
-        noise_bufs = {
-            name: buf.detach()
-            for (name, buf) in copy.deepcopy(self.gen.G.synthesis)
-            .eval()
-            .requires_grad_(False)
-            .to(self.device)
-            .named_buffers()
-            if "noise_const" in name
-        }
-
         opt_latent = self.gen.initial_latent(num_images)
 
         latent_out = torch.zeros(
@@ -261,69 +250,36 @@ class Projector:
         )  # num_steps, *(latent_shape)
 
         optimizer = torch.optim.Adam(
-            [opt_latent] + list(noise_bufs.values()),
+            [opt_latent],
             betas=(0.9, 0.999),
             lr=self.initial_learning_rate,
         )
 
-        # Init noise.
-        for buf in noise_bufs.values():
-            buf[:] = torch.randn_like(buf)
-            buf.requires_grad = True
-
         for step in range(num_steps):
             t = step / num_steps
-            latent_noise_scale = (
-                w_std
-                * self.initial_noise_factor
-                * max(0.0, 1.0 - t / self.noise_ramp_length) ** 2
-            )
 
             lr = self.learning_rate(step, num_steps)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
             # Synth images from opt_w.
-            latent_noise = torch.randn_like(opt_latent) * latent_noise_scale
-            synth_images = self.gen.latent_to_image(
-                opt_latent, latent_noise=latent_noise
-            )
-
-            # Noise regularization.
-            reg_loss = 0.0
-            for v in noise_bufs.values():
-                noise = v[None, None, :, :]  # must be [1,1,H,W] for F.avg_pool2d()
-                while True:
-                    reg_loss += (
-                        noise * torch.roll(noise, shifts=1, dims=3)
-                    ).mean() ** 2
-                    reg_loss += (
-                        noise * torch.roll(noise, shifts=1, dims=2)
-                    ).mean() ** 2
-                    if noise.shape[2] <= 8:
-                        break
-                    noise = F.avg_pool2d(noise, kernel_size=2)
-
-            loss = (
-                self.prior.forward(opt_latent)
-                + self.task.loss(synth_images)
-                + self.regularize_noise_weight * reg_loss
-            )
+            synth_images = self.gen.latent_to_image(opt_latent)
+            
+            if self.prior is not None:
+                prior_loss = self.prior.forward(opt_latent)
+            else:
+                prior_loss = 0
+            task_loss = self.task.loss(synth_images)
+            loss = prior_loss + task_loss
 
             # Step
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            print(f"step {step+1:>4d}/{num_steps}: loss {float(loss):<5.2f}")
+            print(f"step {step+1:>4d}/{num_steps}: prior_loss {float(prior_loss):<5.2f} task_loss {float(task_loss):<5.2f}")
 
             # Save projected W for each optimization step.
             latent_out[step] = opt_latent.detach()
-
-            # Normalize noise.
-            with torch.no_grad():
-                for buf in noise_bufs.values():
-                    buf -= buf.mean()
-                    buf *= buf.square().mean().rsqrt()
 
         return latent_out
 
@@ -416,7 +372,7 @@ class Projector:
 #         )
 #         print(f'Saving optimization progress video "{outdir}/proj.mp4"')
 #         for projected_w in projected_w_steps:
-#             synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode="const")
+#             synth_image = G.synthesis(projected_w.unsqueeze(0))
 #             synth_image = (synth_image + 1) * (255 / 2)
 #             synth_image = (
 #                 synth_image.permute(0, 2, 3, 1)
@@ -431,7 +387,7 @@ class Projector:
 #     # Save final projected frame and W vector.
 #     target_pil.save(f"{outdir}/target.png")
 #     projected_w = projected_w_steps[-1]
-#     synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode="const")
+#     synth_image = G.synthesis(projected_w.unsqueeze(0))
 #     synth_image = (synth_image + 1) * (255 / 2)
 #     synth_image = (
 #         synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
