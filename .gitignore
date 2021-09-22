@@ -1,0 +1,9 @@
+*.jpg
+*.mp3
+*.mp4
+*.png
+__pycache__
+*.swp
+*.ipynb_checkpoints
+*.vscode
+/out
