@@ -49,6 +49,7 @@ def load_target_img(target_fname, img_res):
 @dataclass(eq=False)
 class Generator:
     network_pkl: str
+    normalize_latent: str = None
     device: str = "cpu"
     latent_space: str = "w"
     seed: int = 0
@@ -58,6 +59,17 @@ class Generator:
         with dnnlib.util.open_url(self.network_pkl) as fp:
             self.G = legacy.load_network_pkl(fp)["G_ema"].requires_grad_(False).to(self.device)  # type: ignore
             self.G = self.G.eval().requires_grad_(False).to(self.device)
+
+        num_samples = 10000
+        samples = self.sample_latent_unnormalized(num_samples)
+
+        if self.normalize_latent == "all_dims":
+            self.mean = torch.mean(samples).detach() # N, 1, C -> float
+            self.std = torch.std(samples).detach() # N, 1, C -> float
+        elif self.normalize_latent == "indep_dims":
+            self.mean = torch.mean(samples, axis = 0).detach() # N, 1, C -> 1, C
+            self.std = torch.std(samples, axis = 0).detach() # N, 1, C -> 1, C
+        
 
     def initial_latent(self, batch_size):
         num_samples = 10000
@@ -70,9 +82,13 @@ class Generator:
         else:
             idxs = np.random.permutation(num_samples)[:batch_size]
             initial_latents = samples[idxs]
-        return initial_latents.detach().clone().requires_grad_(True)
 
-    def sample_latent(self, batch_size):
+        if self.normalize_latent:
+            return (initial_latents.detach().clone().requires_grad_(True) - self.mean) / self.std
+        else:
+            return initial_latents.detach().clone().requires_grad_(True)
+
+    def sample_latent_unnormalized(self, batch_size):
         z_samples = torch.randn(batch_size, self.G.z_dim, device=self.device)
         if self.latent_space == "w":
             sample = self.G.mapping(z_samples, None)[:, :1, :]  # N, 1, C
@@ -84,7 +100,18 @@ class Generator:
             sample = einops.repeat(z_samples, "N C -> N W C", W=self.G.mapping.num_ws)
         return sample
 
+    def sample_latent(self, batch_size):
+        if self.normalize_latent:
+            return (self.sample_latent_unnormalized(batch_size) - self.mean) / self.std
+        else:
+            return self.sample_latent_unnormalized(batch_size)
+
+    # Will re-adjust latent to unnormalized.
     def latent_to_image(self, latent):
+
+        if self.normalize_latent:
+            latent = (latent * self.std) + self.mean
+
         if self.latent_space == "w":
             ws = latent.repeat([1, self.G.mapping.num_ws, 1])  # n,1,c -> n, w, c
             images = self.G.synthesis(ws)

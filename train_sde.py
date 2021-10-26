@@ -52,7 +52,7 @@ def train_sde_gan(args):
     log_dir = f'/home/oleksiiv/logs/{exp_name}'
     os.makedirs(log_dir, exist_ok=True)
 
-    generator = Generator(args.network_pkl, device=device, latent_space=args.latent_space)
+    generator = Generator(args.network_pkl, normalize_w=args.normalize_w, device=device, latent_space=args.latent_space)
 
     trainer = ScoreTrainer(args, device=device, sigma=args.sigma, im_width=1, im_height=512)
     trainer.train(args.data, args.num_epochs, args.batch_size, args.lr, generator, max_t=args.max_t, ema_beta=args.ema_beta, save_path=log_dir)
@@ -86,6 +86,7 @@ if __name__ == "__main__":
     ap.add_argument('--latent_space', type=str, default="w")
     ap.add_argument('--num_hidden', type=int, default=5)
     ap.add_argument('--normalize', type=bool, default=False)
+    ap.add_argument('--normalize_w', type=str, default=None)
     ap.add_argument('--ema_beta', type=float, default=0.99)
     args = ap.parse_args()
 

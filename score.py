@@ -229,7 +229,7 @@ class ScoreTrainer:
         """
         return (self.sigma**t).clone().detach()
 
-    def loss_fn(self, x, eps=1e-5, max_t=1):
+    def loss_fn(self, x, eps=1e-5, max_t=1, ema=False):
         """The loss function for training score-based generative models.
 
         Args:
@@ -240,11 +240,15 @@ class ScoreTrainer:
         z = torch.randn_like(x)
         std = self.marginal_prob_std(random_t)
         perturbed_x = x + z * std[:, None, None, None]
-        score = self.score_model(perturbed_x, random_t)
+        if ema:
+            score = self.score_model_ema(perturbed_x, random_t)
+        else:
+            score = self.score_model(perturbed_x, random_t)
         loss = torch.mean(torch.sum((score * std[:, None, None, None] + z)**2, dim=(1,2,3)))
         return loss
     
     def load_network(self, checkpoint_path):
+        # Cannot load whether network is normalized or not
         state_dict = torch.load(checkpoint_path)
         self.score_model.load_state_dict(state_dict)
         self.score_model_ema.load_state_dict(state_dict)
@@ -325,8 +329,21 @@ class ScoreTrainer:
             wandb.log({'avg_loss': avg_loss / num_items})
             # Update the checkpoint after each epoch of training.
             if epoch % log_freq == 0:
-                torch.save(self.score_model.state_dict(), save_path+f'/epoch_{epoch}_ckpt.pth')
-            torch.save(self.score_model.state_dict(), save_path+'/most_recent_ckpt.pth')
+                torch.save(self.score_model_ema.state_dict(), save_path+f'/epoch_{epoch}_ckpt.pth')
+                # Compute the ema loss.
+                if task_type == 'gan':
+                    avg_loss = 0.
+                    num_items = 0
+                    num_batches_per_epoch = 500
+                    for i in range(num_batches_per_epoch):
+                        x = data_source.sample_latent(batch_size)[:, :, None, :]
+                        loss = self.loss_fn(x, max_t=max_t, ema=True)
+                        avg_loss += loss.item() * x.shape[0]
+                        num_items += x.shape[0]
+                    wandb.log({'ema_avg_loss': avg_loss / num_items})
+
+
+            torch.save(self.score_model_ema.state_dict(), save_path+'/most_recent_ckpt.pth')
         
     def Euler_Maruyama_sampler(self,
                             batch_size=64, 
