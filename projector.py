@@ -31,6 +31,8 @@ import clip
 import dnnlib
 import legacy
 
+from score import *
+
 
 def load_target_img(target_fname, img_res):
     target_pil = PIL.Image.open(target_fname).convert("RGB")
@@ -64,11 +66,15 @@ class Generator:
         samples = self.sample_latent_unnormalized(num_samples)
 
         if self.normalize_latent == "all_dims":
-            self.mean = torch.mean(samples).detach() # N, 1, C -> float
-            self.std = torch.std(samples).detach() # N, 1, C -> float
+            print("Normalizing across all channels.")
+            with torch.no_grad():
+                self.mean = torch.mean(samples).detach() # N, 1, C -> float
+                self.std = torch.std(samples).detach() # N, 1, C -> float
         elif self.normalize_latent == "indep_dims":
-            self.mean = torch.mean(samples, axis = 0).detach() # N, 1, C -> 1, C
-            self.std = torch.std(samples, axis = 0).detach() # N, 1, C -> 1, C
+            print("Normalizing each channel independently.")
+            with torch.no_grad():
+                self.mean = torch.mean(samples, axis = 0).detach() # N, 1, C -> 1, C
+                self.std = torch.std(samples, axis = 0).detach() # N, 1, C -> 1, C
         
 
     def initial_latent(self, batch_size):
@@ -84,7 +90,7 @@ class Generator:
             initial_latents = samples[idxs]
 
         if self.normalize_latent:
-            return (initial_latents.detach().clone().requires_grad_(True) - self.mean) / self.std
+            return ((initial_latents - self.mean) / self.std).detach().clone().requires_grad_(True)
         else:
             return initial_latents.detach().clone().requires_grad_(True)
 
@@ -127,6 +133,61 @@ class Generator:
             ws = einops.rearrange(ws[:, 0, :], "(N W) C -> N W C", N=N)
             images = self.G.synthesis(ws)
         return images
+
+@dataclass(eq=False)
+class DiffusionPrior:
+    device: str = "cpu"
+    sigma: float = 25.0
+    hidden_w: int = 1
+    hidden_h: int = 512
+    hidden_dim: int = 4000
+    num_hidden: int = 7
+    normalize: bool = True
+
+    def __post_init__(self):
+        self.score_model = torch.nn.DataParallel(MLPScoreNet(self.hidden_dim, self.num_hidden, self.normalize, lambda x: self.marginal_prob_std(x), self.hidden_w, self.hidden_h))
+        self.score_model = self.score_model.to(self.device)
+
+    def marginal_prob_std(self, t):
+        """Compute the mean and standard deviation of $p_{0t}(x(t) | x(0))$."""
+        if type(t) == float or type(t) == int:
+            t = torch.tensor(t, device=self.device)
+        else:
+            t = t.clone().detach()
+        return torch.sqrt((self.sigma**(2 * t) - 1.) / 2. / np.log(self.sigma))
+    
+    def diffusion_coeff(self, t):
+        """Compute the diffusion coefficient of our SDE."""
+        return (self.sigma**t).clone().detach()
+
+    def step(self, x, t=0.01, snr=0.16, eps=1e-3, step_size=0.01):
+        batch_size = x.shape[0]
+        if len(x.shape) == 3:
+            x = x[:, None, :, :]
+        time_step = t
+        # TODO try varying step size
+
+        batch_time_step = torch.ones(batch_size, device=self.device) * time_step
+        # Corrector step (Langevin MCMC)
+        grad = self.score_model(x, batch_time_step)
+        grad_norm = torch.norm(grad.reshape(grad.shape[0], -1), dim=-1).mean()
+        noise_norm = np.sqrt(np.prod(x.shape[1:]))
+        langevin_step_size = 2 * (snr * noise_norm / grad_norm)**2
+        x = x + langevin_step_size * grad + torch.sqrt(2 * langevin_step_size) * torch.randn_like(x)      
+
+        # Predictor step (Euler-Maruyama)
+        g = self.diffusion_coeff(batch_time_step)
+        x_mean = x + (g**2)[:, None, None, None] * self.score_model(x, batch_time_step) * step_size
+        # x = x_mean + torch.sqrt(g**2 * step_size)[:, None, None, None] * torch.randn_like(x)
+        # TODO experiment add back in noise or not
+        return x_mean[:, 0, :, :]
+
+    def load_network(self, checkpoint_path):
+        # Cannot load whether network is normalized or not
+        state_dict = torch.load(checkpoint_path)
+        out = self.score_model.load_state_dict(state_dict)
+        self.score_model.to(self.device)
+        print(out)
 
 
 @dataclass(eq=False)
@@ -289,16 +350,20 @@ class Projector:
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
+            if isinstance(self.prior, DiffusionPrior):
+                with torch.no_grad():
+                    opt_latent.copy_(self.prior.step(opt_latent))
+
             # Synth images from opt_w.
             synth_images = self.gen.latent_to_image(opt_latent)
             
-            if self.prior is not None:
+            task_loss = self.task.loss(synth_images)
+            if isinstance(self.prior, Prior):
                 prior_loss = self.prior.forward(opt_latent)
             else:
                 prior_loss = 0
-            task_loss = self.task.loss(synth_images)
             loss = prior_loss + task_loss
-
+                
             # Step
             optimizer.zero_grad(set_to_none=True)
             loss.backward()

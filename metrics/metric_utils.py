@@ -39,9 +39,52 @@ class MetricOptions:
         self.rank = rank
         self.device = device if device is not None else torch.device("cuda", rank)
         self.progress = (
+            progress.sub() if progress is not None and rank == 0 else ProgressMonitor(verbose=True)
+        )
+        self.cache = cache
+
+class MetricOptionsDistribution:
+    def __init__(
+        self,
+        generator=None,
+        distr=None,
+        progress=None,
+        cache=True,
+        num_gpus=1,
+        rank=0,
+        device=None,
+    ):
+        self.generator = generator
+        self.distr = distr
+        self.progress = (
             progress.sub() if progress is not None and rank == 0 else ProgressMonitor()
         )
         self.cache = cache
+        self.num_gpus = num_gpus
+        self.rank = rank
+        self.device = device if device is not None else torch.device("cuda", rank)
+
+
+class MetricOptionsDiffusion:
+    def __init__(
+        self,
+        generator=None,
+        trainer=None,
+        progress=None,
+        cache=True,
+        num_gpus=1,
+        rank=0,
+        device=None,
+    ):
+        self.generator = generator
+        self.trainer = trainer
+        self.progress = (
+            progress.sub() if progress is not None and rank == 0 else ProgressMonitor()
+        )
+        self.cache = cache
+        self.num_gpus = num_gpus
+        self.rank = rank
+        self.device = device if device is not None else torch.device("cuda", rank)
 
 
 # ----------------------------------------------------------------------------
@@ -325,19 +368,19 @@ def compute_feature_stats_for_generator(
 
     # Setup generator and load labels.
     G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
-    dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
+    # dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
 
     # Image generation func.
-    def run_generator(z, c):
-        img = G(z=z, c=c, **opts.G_kwargs)
+    def run_generator(z):
+        img = G(z=z, c=None, **opts.G_kwargs)
         img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         return img
 
-    # JIT.
-    if jit:
-        z = torch.zeros([batch_gen, G.z_dim], device=opts.device)
-        c = torch.zeros([batch_gen, G.c_dim], device=opts.device)
-        run_generator = torch.jit.trace(run_generator, [z, c], check_trace=False)
+    # # JIT.
+    # if jit:
+    #     z = torch.zeros([batch_gen, G.z_dim], device=opts.device)
+    #     c = torch.zeros([batch_gen, G.c_dim], device=opts.device)
+    #     run_generator = torch.jit.trace(run_generator, [z, c], check_trace=False)
 
     # Initialize.
     stats = FeatureStats(**stats_kwargs)
@@ -361,12 +404,137 @@ def compute_feature_stats_for_generator(
         images = []
         for _i in range(batch_size // batch_gen):
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
-            c = [
-                dataset.get_label(np.random.randint(len(dataset)))
-                for _i in range(batch_gen)
-            ]
-            c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
-            images.append(run_generator(z, c))
+            # c = [
+            #     dataset.get_label(np.random.randint(len(dataset)))
+            #     for _i in range(batch_gen)
+            # ]
+            # c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
+            images.append(run_generator(z))
+        images = torch.cat(images)
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        features = detector(images, **detector_kwargs)
+        stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
+        progress.update(stats.num_items)
+    return stats
+
+
+# class MetricOptionsDiffusion:
+#     def __init__(
+#         self,
+#         generator=None,
+#         trainer=None,
+#         cache=True,
+#     ):
+
+def compute_feature_stats_for_diffusion_generator(
+    opts,
+    detector_url,
+    detector_kwargs,
+    rel_lo=0,
+    rel_hi=1,
+    batch_size=64,
+    batch_gen=None,
+    jit=False,
+    init_t = 1.,
+    **stats_kwargs,
+):
+    if batch_gen is None:
+        batch_gen = min(batch_size, 4)
+    assert batch_size % batch_gen == 0
+
+    # Setup generator and load labels.
+    trainer = opts.trainer
+    generator = opts.generator
+
+    # Initialize.
+    stats = FeatureStats(**stats_kwargs)
+    assert stats.max_items is not None
+    progress = opts.progress.sub(
+        tag="generator features",
+        num_items=stats.max_items,
+        rel_lo=rel_lo,
+        rel_hi=rel_hi,
+    )
+    detector = get_feature_detector(
+        url=detector_url,
+        device=opts.device,
+        num_gpus=opts.num_gpus,
+        rank=opts.rank,
+        verbose=progress.verbose,
+    )
+
+    # Main loop.
+    while not stats.is_full():
+        images = []
+        for _i in range(batch_size // batch_gen):
+            if init_t < 1.:
+                true_samples = generator.sample_latent(batch_gen)[:,:, None, :]
+                z = torch.randn_like(true_samples)
+                std = trainer.marginal_prob_std(init_t)
+                # TODO: log std
+                init_x = true_samples + z * std
+            else:
+                init_x = None
+            samples = trainer.pc_sampler(num_steps=100, batch_size=batch_gen, init_x=init_x, init_t=init_t)[:, 0, :, :] # batch_gen, 1, 1, 512 -> batch_gen, 1, 512
+            samples = generator.latent_to_image(samples)
+            samples = (samples*127.5 + 128).clamp(0, 255).to(torch.uint8)
+            images.append(samples)
+        images = torch.cat(images)
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        features = detector(images, **detector_kwargs)
+        stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
+        progress.update(stats.num_items)
+    return stats
+
+
+def compute_feature_stats_for_gaussian_generator(
+    opts,
+    detector_url,
+    detector_kwargs,
+    rel_lo=0,
+    rel_hi=1,
+    batch_size=64,
+    batch_gen=None,
+    jit=False,
+    init_t = 1.,
+    **stats_kwargs,
+):
+    if batch_gen is None:
+        batch_gen = min(batch_size, 4)
+    assert batch_size % batch_gen == 0
+
+    # Setup generator and load labels.
+    distr = opts.distr
+    generator = opts.generator
+
+    # Initialize.
+    stats = FeatureStats(**stats_kwargs)
+    assert stats.max_items is not None
+    progress = opts.progress.sub(
+        tag="generator features",
+        num_items=stats.max_items,
+        rel_lo=rel_lo,
+        rel_hi=rel_hi,
+    )
+    detector = get_feature_detector(
+        url=detector_url,
+        device=opts.device,
+        num_gpus=opts.num_gpus,
+        rank=opts.rank,
+        verbose=progress.verbose,
+    )
+
+    # Main loop.
+    while not stats.is_full():
+        images = []
+        for _i in range(batch_size // batch_gen):
+            samples = distr.sample((batch_gen,))[:, 0, :, :]
+            # print("lol", samples.shape)
+            samples = generator.latent_to_image(samples)
+            samples = (samples*127.5 + 128).clamp(0, 255).to(torch.uint8)
+            images.append(samples)
         images = torch.cat(images)
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])

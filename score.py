@@ -24,6 +24,9 @@ import matplotlib.pyplot as plt
 from torch.optim import Adam
 import tqdm
 
+from metrics.frechet_inception_distance import compute_fid_diffusion_vs_dataset, compute_fid_gaussian_vs_dataset
+from metrics.metric_utils import MetricOptions, MetricOptionsDiffusion, MetricOptionsDistribution
+
 class GaussianFourierProjection(nn.Module):
   """Gaussian random features for encoding time steps."""  
   def __init__(self, embed_dim, scale=30.):
@@ -136,7 +139,7 @@ class ScoreNet(nn.Module):
 
 class MLPScoreNet(nn.Module):
 
-  def __init__(self, args, marginal_prob_std, im_width, im_height, embed_dim=256):
+  def __init__(self, hidden_dim, num_hidden, normalize, marginal_prob_std, im_width, im_height, embed_dim=256):
     """Initialize a time-dependent score-based network.
 
     Args:
@@ -148,9 +151,10 @@ class MLPScoreNet(nn.Module):
     super().__init__()
     self.im_width = im_width
     self.im_height = im_height
-    self.hidden_dim = args.hidden_dim
-    self.num_hidden = args.num_hidden
-    self.normalize = args.normalize
+    self.hidden_dim = hidden_dim
+    self.num_hidden = num_hidden
+    self.normalize = normalize
+    self.marginal_prob_std = marginal_prob_std
 
     # Gaussian random feature embedding layer for time
     self.embed = nn.Sequential(GaussianFourierProjection(embed_dim=embed_dim),
@@ -165,15 +169,15 @@ class MLPScoreNet(nn.Module):
     self.embeds.append(nn.Linear(embed_dim, im_width*im_height))
 
     if self.normalize:
-        print("Normalizing over batch.")
+        group_size = 32
+        print(f"Using group norm group size = {group_size}.")
         self.norms = nn.ModuleList([])
         # self.norms.extend([nn.BatchNorm1d(self.hidden_dim) for i in range(self.num_hidden)])
-        self.norms.extend([nn.GroupNorm(32, num_channels=self.hidden_dim) for i in range(self.num_hidden)])
+        self.norms.extend([nn.GroupNorm(group_size, num_channels=self.hidden_dim) for i in range(self.num_hidden)])
     
     # The swish activation function
     self.act = lambda x: x * torch.sigmoid(x)
-    self.marginal_prob_std = marginal_prob_std
-  
+    
   def forward(self, x, t):
     s = x.shape
     # Obtain the Gaussian random feature embedding for t   
@@ -199,7 +203,8 @@ class ScoreTrainer:
     im_width: int = 28
     im_height: int = 28
     def __post_init__(self):
-        self.score_model = torch.nn.DataParallel(MLPScoreNet(self.args, lambda x: self.marginal_prob_std(x), self.im_width, self.im_height))
+        hidden_dim, num_hidden, normalize = args.hidden_dim, args.num_hidden, args.normalize,
+        self.score_model = torch.nn.DataParallel(MLPScoreNet(hidden_dim, num_hidden, normalize, lambda x: self.marginal_prob_std(x), self.im_width, self.im_height))
         # self.score_model = torch.nn.DataParallel(ScoreNet(marginal_prob_std=lambda x: self.marginal_prob_std(x)))
         self.score_model = self.score_model.to(self.device)
         self.score_model_ema = copy.deepcopy(self.score_model).eval().to(self.device).requires_grad_(False)
@@ -213,8 +218,11 @@ class ScoreTrainer:
         
         Returns:
             The standard deviation.
-        """    
-        t = t.clone().detach()
+        """
+        if type(t) == float or type(t) == int:
+            t = torch.tensor(t, device=self.device)
+        else:
+            t = t.clone().detach()
         return torch.sqrt((self.sigma**(2 * t) - 1.) / 2. / np.log(self.sigma))
 
     def diffusion_coeff(self, t):
@@ -253,13 +261,27 @@ class ScoreTrainer:
         self.score_model.load_state_dict(state_dict)
         self.score_model_ema.load_state_dict(state_dict)
     
+    def checkpoint_fid(self, generator, epoch, noise_amount = 1.):
+        with torch.no_grad():
+            diffusion_opts = MetricOptionsDiffusion(generator=generator, trainer=self, device=self.device)
+            dataset_kwargs = {'class_name':'training.dataset.ImageFolderDataset','path':'./lsuncar200k.zip','resolution': 512, 'use_labels':False, 'xflip':False, 'max_size':None}
+            data_opts = MetricOptions(G=generator.G, dataset_kwargs=dataset_kwargs, device=self.device)
+            fid = compute_fid_diffusion_vs_dataset(diffusion_opts, data_opts, None, 50000, init_t=noise_amount)
+        wandb.log({f'{100*noise_amount}percentnoise_fid': fid})
+
+    def checkpoint_ll(self, generator, epoch, batch_size=10000):
+        with torch.no_grad():
+            x = generator.sample_latent(batch_size)[:, :, None, :]
+            z, bpd = self.ode_likelihood(x, batch_size=batch_size)
+            # print("bpdshape", bpd.shape)
+            wandb.log({'diffusion_ll': torch.mean(bpd)})
+
     def checkpoint_images(self, generator, epoch, save_path="."):
         num_samples = 4 ** 2
-        samples = self.pc_sampler(num_steps=1000, batch_size=num_samples)[:, 0, :, :] # 100, 1, 1, 512 -> 100, 1, 512
-        samples = generator.latent_to_image(samples)
-
-        ## Sample visualization.
-        samples = (samples*127.5 + 128).clamp(0, 255).to(torch.uint8)
+        with torch.no_grad():
+            samples = self.pc_sampler(num_steps=1000, batch_size=num_samples)[:, 0, :, :] # 100, 1, 1, 512 -> 100, 1, 512
+            samples = generator.latent_to_image(samples)
+            samples = (samples*127.5 + 128).clamp(0, 255).to(torch.uint8)
         sample_grid = make_grid(samples, nrow=int(np.sqrt(num_samples)))
 
         plt.figure(figsize=(6,6))
@@ -286,9 +308,32 @@ class ScoreTrainer:
                 # video.append_data(np.concatenate([target_uint8, synth_image], axis=1))
             video.close()
     
-    def train(self, task_type, n_epochs, batch_size, lr, data_source, max_t=1, ema_beta = 0.99, save_path=".", log_freq = 300):
+    def checkpoint_gaussian_model(self, generator, num_samples=10000):
+        with torch.no_grad():
+            samples = generator.sample_latent(num_samples)[:, :, None, :]
+            # print("lol2", samples.shape)
+            std, mean = torch.std_mean(samples, 0, unbiased=False)
+            # print("lol1", mean.shape)
+            d = torch.distributions.normal.Normal(mean, std)
+            # https://stats.stackexchange.com/questions/423120/what-is-bits-per-dimension-bits-dim-exactly-in-pixel-cnn-papers
+            test_samples = generator.sample_latent(num_samples)[:, :, None, :]
+            # print("shape", (-1*d.log_prob(test_samples)).shape) # torch.Size([10000, 1, 1, 512])
+            bpd = torch.mean(-d.log_prob(test_samples)) / np.log(2)
+            wandb.log({"gaussian_ll":bpd})
+
+            gaussian_opts = MetricOptionsDistribution(generator=generator, distr=d, device=self.device)
+            dataset_kwargs = {'class_name':'training.dataset.ImageFolderDataset','path':'./lsuncar200k.zip','resolution': 512, 'use_labels':False, 'xflip':False, 'max_size':None}
+            data_opts = MetricOptions(G=generator.G, dataset_kwargs=dataset_kwargs, device=self.device)
+            fid = compute_fid_gaussian_vs_dataset(gaussian_opts, data_opts, None, 10000)
+            wandb.log({'gaussian_fid': fid})
+    
+    def train(self, task_type, n_epochs, batch_size, lr, data_source, max_t=1, ema_beta = 0.99, save_path=".", log_freq = 500):
         optimizer = Adam(self.score_model.parameters(), lr=lr)
         tqdm_epoch = tqdm.trange(n_epochs)
+
+        if task_type == 'gan':
+            self.checkpoint_gaussian_model(data_source)
+
         for epoch in tqdm_epoch:
             avg_loss = 0.
             num_items = 0
@@ -312,8 +357,18 @@ class ScoreTrainer:
                     optimizer.step()
                     avg_loss += loss.item() * x.shape[0]
                     num_items += x.shape[0]
+                
+                wandb.log({"num_latent_seen":(epoch+1) * num_batches_per_epoch * batch_size})
+                
+                if epoch % 50 == 0:
+                    self.checkpoint_ll(data_source, epoch)
 
-                if epoch % log_freq == 0:
+                if epoch > 1000 and epoch % log_freq == 0:
+                    self.checkpoint_fid(data_source, epoch, noise_amount=0.01)
+                    self.checkpoint_fid(data_source, epoch, noise_amount=0.05)
+                    self.checkpoint_fid(data_source, epoch, noise_amount=0.25)
+                    self.checkpoint_fid(data_source, epoch, noise_amount=1.)
+                if epoch % log_freq == 1:
                     self.checkpoint_images(data_source, epoch, save_path=save_path)
                     self.checkpoint_video(data_source, epoch, save_path=save_path)
 
@@ -380,7 +435,9 @@ class ScoreTrainer:
                 num_steps =  500,
                 batch_size=64,
                 snr=0.16,
-                eps=1e-3):
+                eps=1e-3,
+                init_x = None,
+                init_t = 1.):
         """Generate samples from score-based models with Predictor-Corrector method.
         Args:
             batch_size: The number of samplers to generate by calling this function once.
@@ -391,9 +448,13 @@ class ScoreTrainer:
         Returns: 
             Samples.
         """
-        t = torch.ones(batch_size, device=self.device)
-        init_x = torch.randn(batch_size, 1, self.im_width, self.im_height, device=self.device) * self.marginal_prob_std(t)[:, None, None, None]
-        time_steps = np.linspace(1., eps, num_steps)
+        if init_x is not None:
+            assert batch_size == init_x.shape[0]
+
+        t = torch.ones(batch_size, device=self.device) * init_t
+        if init_x is None:
+            init_x = torch.randn(batch_size, 1, self.im_width, self.im_height, device=self.device) * self.marginal_prob_std(t)[:, None, None, None]
+        time_steps = np.linspace(init_t, eps, num_steps)
         step_size = time_steps[0] - time_steps[1]
         x = init_x
         with torch.no_grad():
@@ -501,3 +562,79 @@ class ScoreTrainer:
         x = torch.tensor(res.y[:, -1], device=self.device).reshape(shape)
 
         return x
+
+    def prior_likelihood(self, z, sigma):
+        """The likelihood of a Gaussian distribution with mean zero and 
+            standard deviation sigma."""
+        shape = z.shape
+        N = np.prod(shape[1:])
+        return -N / 2. * torch.log(2*np.pi*sigma**2) - torch.sum(z**2, dim=(1,2,3)) / (2 * sigma**2)
+
+    def ode_likelihood(self, x, 
+                    batch_size=64,
+                    eps=1e-5):
+        """Compute the likelihood with probability flow ODE.
+        
+        Args:
+            x: Input data.
+            batch_size: The batch size. Equals to the leading dimension of `x`.
+            eps: A `float` number. The smallest time step for numerical stability.
+
+        Returns:
+            z: The latent code for `x`.
+            bpd: The log-likelihoods in bits/dim.
+        """
+
+        # Draw the random Gaussian sample for Skilling-Hutchinson's estimator.
+        epsilon = torch.randn_like(x)
+            
+        def divergence_eval(sample, time_steps, epsilon):      
+            """Compute the divergence of the score-based model with Skilling-Hutchinson."""
+            with torch.enable_grad():
+                sample.requires_grad_(True)
+                score_e = torch.sum(self.score_model(sample, time_steps) * epsilon)
+                grad_score_e = torch.autograd.grad(score_e, sample)[0]
+            return torch.sum(grad_score_e * epsilon, dim=(1, 2, 3))    
+        
+        shape = x.shape
+
+        def score_eval_wrapper(sample, time_steps):
+            """A wrapper for evaluating the score-based model for the black-box ODE solver."""
+            sample = torch.tensor(sample, device=self.device, dtype=torch.float32).reshape(shape)
+            time_steps = torch.tensor(time_steps, device=self.device, dtype=torch.float32).reshape((sample.shape[0], ))    
+            with torch.no_grad():    
+                score = self.score_model(sample, time_steps)
+            return score.cpu().numpy().reshape((-1,)).astype(np.float64)
+        
+        def divergence_eval_wrapper(sample, time_steps):
+            """A wrapper for evaluating the divergence of score for the black-box ODE solver."""
+            with torch.no_grad():
+                # Obtain x(t) by solving the probability flow ODE.
+                sample = torch.tensor(sample, device=self.device, dtype=torch.float32).reshape(shape)
+                time_steps = torch.tensor(time_steps, device=self.device, dtype=torch.float32).reshape((sample.shape[0], ))    
+                # Compute likelihood.
+                div = divergence_eval(sample, time_steps, epsilon)
+                return div.cpu().numpy().reshape((-1,)).astype(np.float64)
+        
+        def ode_func(t, x):
+            """The ODE function for the black-box solver."""
+            time_steps = np.ones((shape[0],)) * t    
+            sample = x[:-shape[0]]
+            logp = x[-shape[0]:]
+            g = self.diffusion_coeff(torch.tensor(t)).cpu().numpy()
+            sample_grad = -0.5 * g**2 * score_eval_wrapper(sample, time_steps)
+            logp_grad = -0.5 * g**2 * divergence_eval_wrapper(sample, time_steps)
+            return np.concatenate([sample_grad, logp_grad], axis=0)
+
+        init = np.concatenate([x.cpu().numpy().reshape((-1,)), np.zeros((shape[0],))], axis=0)
+        # Black-box ODE solver
+        res = integrate.solve_ivp(ode_func, (eps, 1.), init, rtol=1e-5, atol=1e-5, method='RK45')  
+        zp = torch.tensor(res.y[:, -1], device=self.device)
+        z = zp[:-shape[0]].reshape(shape)
+        delta_logp = zp[-shape[0]:].reshape(shape[0])
+        sigma_max = self.marginal_prob_std(1.)
+        prior_logp = self.prior_likelihood(z, sigma_max)
+        bpd = -(prior_logp + delta_logp) / np.log(2)
+        N = np.prod(shape[1:])
+        bpd = bpd / N + 8.
+        return z, bpd
