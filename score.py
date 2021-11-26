@@ -203,7 +203,7 @@ class ScoreTrainer:
     im_width: int = 28
     im_height: int = 28
     def __post_init__(self):
-        hidden_dim, num_hidden, normalize = args.hidden_dim, args.num_hidden, args.normalize,
+        hidden_dim, num_hidden, normalize = self.args.hidden_dim, self.args.num_hidden, self.args.normalize,
         self.score_model = torch.nn.DataParallel(MLPScoreNet(hidden_dim, num_hidden, normalize, lambda x: self.marginal_prob_std(x), self.im_width, self.im_height))
         # self.score_model = torch.nn.DataParallel(ScoreNet(marginal_prob_std=lambda x: self.marginal_prob_std(x)))
         self.score_model = self.score_model.to(self.device)
@@ -249,8 +249,10 @@ class ScoreTrainer:
         std = self.marginal_prob_std(random_t)
         perturbed_x = x + z * std[:, None, None, None]
         if ema:
+            self.score_model_ema.eval()
             score = self.score_model_ema(perturbed_x, random_t)
         else:
+            self.score_model.train()
             score = self.score_model(perturbed_x, random_t)
         loss = torch.mean(torch.sum((score * std[:, None, None, None] + z)**2, dim=(1,2,3)))
         return loss
@@ -420,6 +422,7 @@ class ScoreTrainer:
         step_size = time_steps[0] - time_steps[1]
         x = init_x
         with torch.no_grad():
+            self.score_model.eval()
             for time_step in tqdm.notebook.tqdm(time_steps):      
                 batch_time_step = torch.ones(batch_size, device=self.device) * time_step
                 g = self.diffusion_coeff(batch_time_step)
@@ -457,6 +460,7 @@ class ScoreTrainer:
         time_steps = np.linspace(init_t, eps, num_steps)
         step_size = time_steps[0] - time_steps[1]
         x = init_x
+        self.score_model_ema.eval()
         with torch.no_grad():
             for time_step in time_steps:      
                 batch_time_step = torch.ones(batch_size, device=self.device) * time_step
@@ -497,6 +501,7 @@ class ScoreTrainer:
         step_size = time_steps[0] - time_steps[1]
         x = init_x
         i = 0
+        self.score_model_ema.eval()
         with torch.no_grad():
             for time_step in time_steps:      
                 batch_time_step = torch.ones(batch_size, device=self.device) * time_step
@@ -542,6 +547,7 @@ class ScoreTrainer:
             
         shape = init_x.shape
 
+        self.score_model_ema.eval()
         def score_eval_wrapper(sample, time_steps):
             """A wrapper of the score-based model for use by the ODE solver."""
             sample = torch.tensor(sample, device=self.device, dtype=torch.float32).reshape(shape)
@@ -587,12 +593,13 @@ class ScoreTrainer:
 
         # Draw the random Gaussian sample for Skilling-Hutchinson's estimator.
         epsilon = torch.randn_like(x)
+        self.score_model_ema.eval()
             
         def divergence_eval(sample, time_steps, epsilon):      
             """Compute the divergence of the score-based model with Skilling-Hutchinson."""
             with torch.enable_grad():
                 sample.requires_grad_(True)
-                score_e = torch.sum(self.score_model(sample, time_steps) * epsilon)
+                score_e = torch.sum(self.score_model_ema(sample, time_steps) * epsilon)
                 grad_score_e = torch.autograd.grad(score_e, sample)[0]
             return torch.sum(grad_score_e * epsilon, dim=(1, 2, 3))    
         
@@ -603,7 +610,7 @@ class ScoreTrainer:
             sample = torch.tensor(sample, device=self.device, dtype=torch.float32).reshape(shape)
             time_steps = torch.tensor(time_steps, device=self.device, dtype=torch.float32).reshape((sample.shape[0], ))    
             with torch.no_grad():    
-                score = self.score_model(sample, time_steps)
+                score = self.score_model_ema(sample, time_steps)
             return score.cpu().numpy().reshape((-1,)).astype(np.float64)
         
         def divergence_eval_wrapper(sample, time_steps):
