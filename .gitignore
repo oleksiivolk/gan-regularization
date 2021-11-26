@@ -7,3 +7,8 @@ __pycache__
 *.ipynb_checkpoints
 *.vscode
 /out
+wandb
+~
+*.zip
+*.pth
+MNIST

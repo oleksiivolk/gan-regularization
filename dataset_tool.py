@@ -290,7 +290,8 @@ def make_transform(
 
 def open_dataset(source, *, max_images: Optional[int]):
     if os.path.isdir(source):
-        if source.rstrip("/").endswith("_lmdb"):
+        # if source.rstrip("/").endswith("_lmdb"):
+        if True:
             return open_lmdb(source, max_images=max_images)
         else:
             return open_image_folder(source, max_images=max_images)
@@ -318,6 +319,7 @@ def open_dest(
     if dest_ext == "zip":
         if os.path.dirname(dest) != "":
             os.makedirs(os.path.dirname(dest), exist_ok=True)
+        print(dest)
         zf = zipfile.ZipFile(file=dest, mode="w", compression=zipfile.ZIP_STORED)
 
         def zip_write_bytes(fname: str, data: Union[bytes, str]):
@@ -456,6 +458,8 @@ def convert_dataset(
 
     num_files, input_iter = open_dataset(source, max_images=max_images)
     archive_root_dir, save_bytes, close_dest = open_dest(dest)
+
+    print("lol", archive_root_dir)
 
     transform_image = make_transform(transform, width, height, resize_filter)
 
