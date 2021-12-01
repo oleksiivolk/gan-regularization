@@ -365,7 +365,8 @@ class ScoreTrainer:
                 if epoch % 50 == 0:
                     self.checkpoint_ll(data_source, epoch)
 
-                if epoch > 1000 and epoch % log_freq == 0:
+                if True:
+                # if epoch > 1000 and epoch % log_freq == 0:
                     self.checkpoint_fid(data_source, epoch, noise_amount=0.01)
                     self.checkpoint_fid(data_source, epoch, noise_amount=0.05)
                     self.checkpoint_fid(data_source, epoch, noise_amount=0.25)

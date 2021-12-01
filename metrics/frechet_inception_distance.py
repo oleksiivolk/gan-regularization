@@ -64,7 +64,6 @@ def compute_fid_diffusion_vs_dataset(diffusion_opts, data_opts, max_real, num_ge
     detector_kwargs = dict(
         return_features=True
     )  # Return raw features before the softmax layer.
-
     mu_gen, sigma_gen = metric_utils.compute_feature_stats_for_diffusion_generator(
         opts=diffusion_opts,
         detector_url=detector_url,
@@ -104,6 +103,42 @@ def compute_fid_gaussian_vs_dataset(gaussian_opts, data_opts, max_real, num_gen)
 
     mu_gen, sigma_gen = metric_utils.compute_feature_stats_for_gaussian_generator(
         opts=gaussian_opts,
+        detector_url=detector_url,
+        detector_kwargs=detector_kwargs,
+        rel_lo=0,
+        rel_hi=1,
+        capture_mean_cov=True,
+        batch_gen=8,
+        max_items=num_gen,
+    ).get_mean_cov()
+
+    mu_real, sigma_real = metric_utils.compute_feature_stats_for_dataset(
+        opts=data_opts,
+        detector_url=detector_url,
+        detector_kwargs=detector_kwargs,
+        rel_lo=0,
+        rel_hi=0,
+        capture_mean_cov=True,
+        max_items=max_real,
+    ).get_mean_cov()
+
+
+    m = np.square(mu_gen - mu_real).sum()
+    s, _ = scipy.linalg.sqrtm(
+        np.dot(sigma_gen, sigma_real), disp=False
+    )  # pylint: disable=no-member
+    fid = np.real(m + np.trace(sigma_gen + sigma_real - s * 2))
+    return float(fid)
+
+def compute_fid_projector_vs_dataset(projector_opts, data_opts, max_real, num_gen):
+    # Direct TorchScript translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
+    detector_url = "https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/inception-2015-12-05.pt"
+    detector_kwargs = dict(
+        return_features=True
+    )  # Return raw features before the softmax layer.
+
+    mu_gen, sigma_gen = metric_utils.compute_feature_stats_for_projector(
+        opts=projector_opts,
         detector_url=detector_url,
         detector_kwargs=detector_kwargs,
         rel_lo=0,

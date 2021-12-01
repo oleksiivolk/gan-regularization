@@ -544,4 +544,81 @@ def compute_feature_stats_for_gaussian_generator(
     return stats
 
 
+class MetricOptionsProjector:
+    def __init__(
+        self,
+        projector=None,
+        progress=None,
+        cache=True,
+        num_gpus=1,
+        rank=0,
+        device=None,
+        kwargs=None,
+    ):
+        self.projector = projector
+        self.progress = (
+            progress.sub() if progress is not None and rank == 0 else ProgressMonitor()
+        )
+        self.cache = cache
+        self.num_gpus = num_gpus
+        self.rank = rank
+        self.device = device if device is not None else torch.device("cuda", rank)
+        self.kwargs = kwargs
+
+def compute_feature_stats_for_projector(
+    opts,
+    detector_url,
+    detector_kwargs,
+    rel_lo=0,
+    rel_hi=1,
+    batch_size=64,
+    batch_gen=None,
+    **stats_kwargs,
+):
+    if batch_gen is None:
+        batch_gen = min(batch_size, 8)
+    assert batch_size % batch_gen == 0
+
+    # Setup generator and load labels.
+    projector = opts.projector
+    projector_kwags = opts.kwargs
+
+    # Initialize.
+    stats = FeatureStats(**stats_kwargs)
+    assert stats.max_items is not None
+    progress = opts.progress.sub(
+        tag="projector features",
+        num_items=stats.max_items,
+        rel_lo=rel_lo,
+        rel_hi=rel_hi,
+    )
+    detector = get_feature_detector(
+        url=detector_url,
+        device=opts.device,
+        num_gpus=opts.num_gpus,
+        rank=opts.rank,
+        verbose=progress.verbose,
+    )
+
+    # Main loop.
+    while not stats.is_full():
+        images = []
+        for _i in range(batch_size // batch_gen):
+            projected_w = projector.project(
+                num_images=batch_gen,
+                progress=False,
+                **projector_kwags
+            )
+            samples = projector.gen.latent_to_image(projected_w)
+            samples = (samples + 1) * (255/2)
+            samples = samples.clamp(0, 255).to(torch.uint8)
+            images.append(samples)
+        images = torch.cat(images)
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        features = detector(images, **detector_kwargs)
+        stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
+        progress.update(stats.num_items)
+    return stats
+
 # ----------------------------------------------------------------------------

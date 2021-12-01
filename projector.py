@@ -479,6 +479,7 @@ class Projector:
         optimizer_step=True,
         diffusion_magnitude_lambda = 2,
         save_video = False,
+        progress=True,
     ):
         diffusion_total_steps = num_steps * num_diffusion_steps_per_step
         diffusion_steps = 0
@@ -495,69 +496,76 @@ class Projector:
             [opt_latent], betas=(0.9, 0.999), lr=learning_rate,
         )
 
-        with tqdm.trange(num_steps) as progress_bar:
-            for step in progress_bar:
-                t = step / num_steps
+        if progress:
+            iterator = tqdm.trange(num_steps) 
+        else:
+            iterator = range(num_steps)
 
-                lr = self.learning_rate(step, num_steps)
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
+        for step in iterator:
+            t = step / num_steps
 
-                # Synth images from opt_w.
-                synth_images = self.gen.latent_to_image(opt_latent)
+            lr = self.learning_rate(step, num_steps)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-                if optimizer_step:
-                    task_loss = self.task.loss(synth_images)
-                else:
-                    task_loss = 0
-                if isinstance(self.prior, Prior):
-                    prior_loss = self.prior.forward(opt_latent) * prior_loss_weight
-                else:
-                    prior_loss = 0
-                loss = prior_loss + task_loss
+            # Synth images from opt_w.
+            synth_images = self.gen.latent_to_image(opt_latent)
 
-                before_update_latent = opt_latent.clone().detach()
-                # Step
-                if loss != 0:
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    optimizer.step()
+            if optimizer_step:
+                task_loss = self.task.loss(synth_images)
+            else:
+                task_loss = 0
+            if isinstance(self.prior, Prior):
+                prior_loss = self.prior.forward(opt_latent) * prior_loss_weight
+            else:
+                prior_loss = 0
+            loss = prior_loss + task_loss
+            # print(task_loss)
 
-                optimizer_update_norm = torch.norm(
-                    opt_latent - before_update_latent, dim=(1, 2)
-                )
-                # print(2, optimizer_update_norm)
+            before_update_latent = opt_latent.clone().detach()
+            # Step
+            if loss != 0:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
 
-                if isinstance(self.prior, DiffusionPrior):
-                    with torch.no_grad():
-                        for inner_diffusion_step in range(num_diffusion_steps_per_step):
+            optimizer_update_norm = torch.norm(
+                opt_latent - before_update_latent, dim=(1, 2)
+            )
+            # print(2, optimizer_update_norm)
+
+            if isinstance(self.prior, DiffusionPrior):
+                with torch.no_grad():
+                    for inner_diffusion_step in range(num_diffusion_steps_per_step):
+                        new_latent = torch.zeros(opt_latent.shape).to(self.device)
+                        for i in range(list(opt_latent.shape)[1]):
                             eps = 1e-5
                             if diffusion_time_schedule == "linear":
-                                new_latent = self.prior.step(
-                                    opt_latent,
+                                new_latent[:, i] = self.prior.step(
+                                    opt_latent[:, i:i+1],
                                     t=1 - diffusion_steps / diffusion_total_steps + eps,
                                     step_size=diffusion_step_size,
-                                )
+                                )[:, 0]
                             elif diffusion_time_schedule == "constant":
-                                new_latent = self.prior.step(
-                                    opt_latent,
+                                new_latent[:, i] = self.prior.step(
+                                    opt_latent[:, i:i+1],
                                     t=diffusion_step_size,
                                     step_size=diffusion_step_size,
-                                )
+                                )[:, 0]
                             elif diffusion_time_schedule == "mini":
-                                new_latent = self.prior.step(
-                                    opt_latent,
+                                new_latent[:, i] = self.prior.step(
+                                    opt_latent[:, i:i+1],
                                     t=1
                                     - inner_diffusion_step
                                     / num_diffusion_steps_per_step,
                                     step_size=diffusion_step_size,
-                                )
+                                )[:, 0]
                             elif diffusion_time_schedule == "mini_end":
                                 step_size = (
                                     mini_end_init_t / num_diffusion_steps_per_step
                                 )
-                                new_latent = self.prior.step(
-                                    opt_latent,
+                                new_latent[:, i] = self.prior.step(
+                                    opt_latent[:, i:i+1],
                                     t=mini_end_init_t
                                     * (
                                         1
@@ -566,35 +574,35 @@ class Projector:
                                     )
                                     + eps,
                                     step_size=step_size,
-                                )
+                                )[:, 0]
+                        # print(new_latent.shape)
+                        diffusion_update_norm = torch.norm(
+                            new_latent - opt_latent, dim=(1, 2)
+                        )
+                        update = (
+                            (new_latent - opt_latent)
+                            / diffusion_update_norm[:, None, None]
+                            * optimizer_update_norm[:, None, None].clamp(max=1)
+                            / diffusion_magnitude_lambda
+                            # * inner_diffusion_step
+                            # / num_diffusion_steps_per_step
+                        )
+                        # print("1", diffusion_update_norm)
+                        new_latent = opt_latent + update
+                        opt_latent.copy_(new_latent)
+                        diffusion_steps += 1
 
-                            diffusion_update_norm = torch.norm(
-                                new_latent - opt_latent, dim=(1, 2)
-                            )
-                            update = (
-                                (new_latent - opt_latent)
-                                / diffusion_update_norm[:, None, None]
-                                * optimizer_update_norm[:, None, None].clamp(max=1)
-                                / diffusion_magnitude_lambda
-                                * inner_diffusion_step
-                                / num_diffusion_steps_per_step
-                            )
-                            # print("1", diffusion_update_norm)
-                            new_latent = opt_latent + update
-                            opt_latent.copy_(new_latent)
-                            diffusion_steps += 1
+            # if isinstance(self.prior, DiffusionPrior):
+            #     progress_bar.set_description(f"Optimizer step norm = {optimizer_update_norm}; diffusion norm = {diffusion_update_norm}")
 
-                # if isinstance(self.prior, DiffusionPrior):
-                #     progress_bar.set_description(f"Optimizer step norm = {optimizer_update_norm}; diffusion norm = {diffusion_update_norm}")
+            # print(f"step {step+1:>4d}/{num_steps}: prior_loss {float(prior_loss):<5.2f} task_loss {float(task_loss):<5.2f}")
 
-                # print(f"step {step+1:>4d}/{num_steps}: prior_loss {float(prior_loss):<5.2f} task_loss {float(task_loss):<5.2f}")
+            # Log magnitudes of task step and diffusion step
+            # guided diffusion
 
-                # Log magnitudes of task step and diffusion step
-                # guided diffusion
-
-                # Save projected W for each optimization step.
-                if save_video:
-                    latent_out[step] = opt_latent.detach()
+            # Save projected W for each optimization step.
+            if save_video:
+                latent_out[step] = opt_latent.detach()
         if save_video:
             return latent_out
         else:
