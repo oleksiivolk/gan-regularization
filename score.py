@@ -333,8 +333,8 @@ class ScoreTrainer:
         optimizer = Adam(self.score_model.parameters(), lr=lr)
         tqdm_epoch = tqdm.trange(n_epochs)
 
-        if task_type == 'gan':
-            self.checkpoint_gaussian_model(data_source)
+        # if task_type == 'gan':
+        #     self.checkpoint_gaussian_model(data_source)
 
         for epoch in tqdm_epoch:
             avg_loss = 0.
@@ -363,17 +363,17 @@ class ScoreTrainer:
                 wandb.log({"num_latent_seen":(epoch+1) * num_batches_per_epoch * batch_size})
                 
                 if epoch % 50 == 0:
-                    self.checkpoint_ll(data_source, epoch)
+                    self.checkpoint_ll(data_source, epoch, batch_size=100)
 
-                if True:
-                # if epoch > 1000 and epoch % log_freq == 0:
-                    self.checkpoint_fid(data_source, epoch, noise_amount=0.01)
+                # if True:
+                if epoch >= 1000 and epoch % log_freq == 0:
+                    # self.checkpoint_fid(data_source, epoch, noise_amount=0.01)
                     self.checkpoint_fid(data_source, epoch, noise_amount=0.05)
-                    self.checkpoint_fid(data_source, epoch, noise_amount=0.25)
+                    # self.checkpoint_fid(data_source, epoch, noise_amount=0.25)
                     self.checkpoint_fid(data_source, epoch, noise_amount=1.)
                 if epoch % log_freq == 1:
                     self.checkpoint_images(data_source, epoch, save_path=save_path)
-                    self.checkpoint_video(data_source, epoch, save_path=save_path)
+                    # self.checkpoint_video(data_source, epoch, save_path=save_path)
 
             # Update EMA.
             with torch.autograd.profiler.record_function("ema"):

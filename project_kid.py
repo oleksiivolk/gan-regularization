@@ -20,7 +20,6 @@ from metrics.metric_utils import MetricOptions, MetricOptionsDiffusion, MetricOp
 
 # network_pkl = "https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/ffhq.pkl"
 network_pkl = "https://nvlabs-fi-cdn.nvidia.com/stylegan2/networks/stylegan2-car-config-f.pkl"
-target_fname = "efros.jpg"
 outdir = "out"
 save_video = True
 seed = 202
@@ -59,13 +58,18 @@ projector = Projector(generator, task, prior=prior, device=device)
 projector_kwargs = {
     "learning_rate":0.01,
     "num_steps":100,
-    "prior_loss_weight": 0.01,
+    "prior_loss_weight": 0,
 }
 
 proj_opts = MetricOptionsProjector(projector=projector, device=device, kwargs=projector_kwargs)
 dataset_kwargs = {'class_name':'training.dataset.ImageFolderDataset','path':'/home/oleksiiv/gan-regularization/lsuncar200k.zip','resolution': 512, 'use_labels':False, 'xflip':False, 'max_size':None}
 data_opts = MetricOptions(G=generator.G, dataset_kwargs=dataset_kwargs, device=device)
-fid = compute_fid_projector_vs_dataset(proj_opts, data_opts, None, 1000)
+# fid = compute_fid_projector_vs_dataset(proj_opts, data_opts, None, 100)
+kid = compute_kid_projector(proj_opts, data_opts, None, 5000, 100, 1000)
 
+mse_task = Task(device=device, target=target, task_type = "l2")
+vgg_loss, mse_loss = calculate_tasks_losses(proj_opts, [task, mse_task], batch_size=8, num_samples=5000)
+
+print(f"Type {prior.prior_type}")
 print(projector_kwargs)
-print(f"FID = {fid}")
+print(f"kid = {kid}, vgg = {vgg_loss}, mse = {mse_loss}")

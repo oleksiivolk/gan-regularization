@@ -108,6 +108,10 @@ class Generator:
             sample = z_samples
         elif self.latent_space == "z+":
             sample = einops.repeat(z_samples, "N C -> N W C", W=self.G.mapping.num_ws)
+        elif self.latent_space == "style":
+            sample = self.G.mapping(z_samples, None)
+            sample = self.G.synthesis.ws_to_styles(sample)[:, None, :]  # N, 1, C
+        # elif ...
         return sample
 
     def sample_latent(self, batch_size):
@@ -136,6 +140,8 @@ class Generator:
             ws = self.G.mapping(latent, None)
             ws = einops.rearrange(ws[:, 0, :], "(N W) C -> N W C", N=N)
             images = self.G.synthesis(ws)
+        elif self.latent_space == "style":
+            images = self.G.synthesis.styles_to_images(latent[:, 0, :]) # N, 1, C -> N, C
         return images
 
 
@@ -202,11 +208,11 @@ class DiffusionPrior:
             * self.score_model(x, batch_time_step)
             * step_size
         )
-        x = x_mean + torch.sqrt(g ** 2 * step_size)[
-            :, None, None, None
-        ] * torch.randn_like(x)
+        # x = x_mean + torch.sqrt(g ** 2 * step_size)[
+        #     :, None, None, None
+        # ] * torch.randn_like(x)
         # TODO experiment add back in noise or not
-        return x[:, 0, :, :]
+        return x_mean[:, 0, :, :]
 
     def load_network(self, checkpoint_path):
         # Cannot load whether network is normalized or not
@@ -367,6 +373,25 @@ class Prior:
         return cluster_centers.to(self.device)  # [num_clusters, C]
 
 
+def calculate_tasks_losses(opts, tasks, batch_size=8, num_samples=1000):
+    projector = opts.projector
+    projector_kwags = opts.kwargs
+
+    losses = [0 for i in range(len(tasks))]
+    for _ in range(num_samples//batch_size):
+        projected_w = projector.project(
+            num_images=batch_size,
+            progress=False,
+            **projector_kwags
+        )
+        with torch.no_grad():
+            images = projector.gen.latent_to_image(projected_w)
+            for i in range(len(tasks)):
+                # print(tasks[i].loss(images))
+                losses[i] += tasks[i].loss(images)
+        # print(losses)
+    return [loss / (num_samples//batch_size) for loss in losses]
+
 @dataclass(eq=False)
 class Task:
     device: str = "cpu"
@@ -403,10 +428,13 @@ class Task:
                 self.target_features = self.clip_model.encode_text(text)
             self.cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
         elif self.task_type == "inpainting":
-            self.target = self.target.to(self.device)
+            self.target = self.target.to(self.device)*2/255 - 1
             self.mask = self.mask.to(self.device)
+        elif self.task_type == "l2":
+            self.target = self.target.to(self.device)*2/255 - 1
 
     def loss(self, images):
+        batch_size = images.size(0)
         images = images.to(self.device)
         if self.task_type == "perceptual" or self.task_type == "perceptual_inpainting":
             # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
@@ -418,16 +446,17 @@ class Task:
 
             # Features for synth images.
             synth_features = self.vgg16(images, resize_images=False, return_lpips=True)
-            return (self.target_features - synth_features).square().sum()
-        if self.task_type == "inpainting":
-            images = (images + 1) * (255 / 2)
-            return (self.mask * (self.target - images)).square().sum()
+            return (self.target_features - synth_features).square().sum() / batch_size
+        elif self.task_type == "inpainting":
+            return (self.mask * (self.target - images)).square().sum() / batch_size
         elif self.task_type == "clip_text":
             # TODO: Maybe preprocess with clip
             if images.shape[2] > 224:
                 images = F.interpolate(images, size=(224, 224), mode="area")
             synth_features = self.clip_model.encode_image(images)
-            return (1 - self.cos(synth_features, self.target_features)).sum()
+            return (1 - self.cos(synth_features, self.target_features)).sum() / batch_size
+        elif self.task_type == "l2":
+            return (self.target - images).square().sum() / batch_size
 
 
 @dataclass(eq=False)
@@ -491,7 +520,8 @@ class Projector:
                 dtype=torch.float32,
                 device=self.device,
             )  # num_steps, *(latent_shape)
-
+        
+        self.initial_learning_rate = learning_rate
         optimizer = torch.optim.Adam(
             [opt_latent], betas=(0.9, 0.999), lr=learning_rate,
         )

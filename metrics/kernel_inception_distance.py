@@ -60,7 +60,7 @@ def compute_kid(opts, max_real, num_gen, num_subsets, max_subset_size):
     return float(kid)
 
 
-def compute_kid_projector(data_opts, projector_opts, max_real, num_gen, num_subsets, max_subset_size):
+def compute_kid_projector(projector_opts, data_opts, max_real, num_gen, num_subsets, max_subset_size):
     # Direct TorchScript translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
     detector_url = "https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/inception-2015-12-05.pt"
     detector_kwargs = dict(

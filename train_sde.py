@@ -54,7 +54,7 @@ def train_sde_gan(args):
 
     generator = Generator(args.network_pkl, normalize_latent=args.normalize_w, device=device, latent_space=args.latent_space)
 
-    trainer = ScoreTrainer(args, device=device, sigma=args.sigma, im_width=1, im_height=512)
+    trainer = ScoreTrainer(args, device=device, sigma=args.sigma, im_width=1, im_height=8960)
     trainer.train(args.data, args.num_epochs, args.batch_size, args.lr, generator, max_t=args.max_t, ema_beta=args.ema_beta, save_path=log_dir)
 
     num_samples = 4 ** 2
